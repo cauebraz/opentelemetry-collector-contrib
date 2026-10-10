@@ -167,6 +167,9 @@ type cardinalityProcessor struct {
 	rejectionWarned atomic.Bool
 	dropLogCount    atomic.Int64
 	dropsThisEpoch  atomic.Int64
+	// warmedUp stays false until the first epoch rotation. Until then every
+	// tracker has a zero baseline, so enforcing would strip stable labels.
+	warmedUp atomic.Bool
 
 	// telemetry is held so Shutdown can unregister the observable callbacks;
 	// without that the SDK keeps the processor (and its 256 shards) alive.
@@ -584,6 +587,9 @@ func (p *cardinalityProcessor) rotate() {
 		}
 	}
 
+	// Trackers now carry the first epoch's count as their baseline.
+	p.warmedUp.Store(true)
+
 	// Reset the warning flag so we can log again next epoch if still bounded
 	p.rejectionWarned.Store(false)
 
@@ -794,6 +800,11 @@ func (p *cardinalityProcessor) shouldDrop(metricName, attrKey string, attrVal pc
 	// HLL insert and estimate happen under the per-tracker lock, completely
 	// independent of the shard lock.
 	currCount, prevCount := t.insert(hashVal)
+
+	// The first epoch only builds baselines; see warmedUp.
+	if !p.warmedUp.Load() {
+		return false
+	}
 
 	// Guard against uint64 underflow caused by HLL probabilistic estimation
 	// variance — if the current count has not grown, nothing should be dropped.

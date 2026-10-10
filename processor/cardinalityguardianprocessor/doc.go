@@ -23,7 +23,8 @@
 // unique values the label has acquired this epoch. When that delta exceeds
 // MaxCardinalityDeltaPerEpoch the offending attribute is handled per the
 // configured EnforcementMode (EnforcementTagOnly, EnforcementOverflowAttribute,
-// or EnforcementStripAndReaggregate).
+// or EnforcementStripAndReaggregate). Nothing is enforced before the first
+// rotation, because every tracker still has a zero baseline.
 //
 // # Architecture
 //

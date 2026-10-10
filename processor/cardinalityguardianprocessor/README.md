@@ -74,6 +74,8 @@ Key design decisions:
 
 The Cardinality Guardian processor detects labels with abnormal growth using HyperLogLog++ sketches. It measures the *delta* (new unique values per epoch), not absolute cardinality, so stable high-cardinality metrics are never penalized.
 
+The first epoch after the Collector starts only builds the baseline: nothing is enforced until the first rotation. After that, a label first seen in a later epoch is enforced from its first data point.
+
 Three enforcement modes control what happens when a label exceeds the threshold:
 
 ```yaml

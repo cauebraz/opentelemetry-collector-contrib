@@ -1,0 +1,11 @@
+change_type: bug_fix
+
+component: processor/cardinality_guardian
+
+note: Stop stripping stable high-cardinality labels during the first epoch after the Collector starts
+
+issues: [50406]
+
+subtext:
+
+change_logs: [user]

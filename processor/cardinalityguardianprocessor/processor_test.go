@@ -15,6 +15,7 @@ import (
 	"go.opentelemetry.io/collector/consumer/consumertest"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/processor"
 	"go.opentelemetry.io/collector/processor/processortest"
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
@@ -22,6 +23,12 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 )
+
+// warmUp completes the processor's first epoch, after which trackers created
+// for new labels are enforced from their first data point.
+func warmUp(proc processor.Metrics) {
+	proc.(*cardinalityProcessor).rotate()
+}
 
 func TestCardinalityProcessor_ConsumeMetrics(t *testing.T) {
 	cfg := &Config{
@@ -89,6 +96,7 @@ func TestCardinalityProcessor_HighCardinalityLimit(t *testing.T) {
 	set := processortest.NewNopSettings(component.MustNewType("cardinality_guardian"))
 	p, err := newCardinalityProcessor(t.Context(), cfg, set, next)
 	require.NoError(t, err)
+	warmUp(p)
 
 	err = p.Start(t.Context(), nil)
 	require.NoError(t, err)
@@ -270,6 +278,7 @@ func TestCardinalityProcessor_TagOnlyMode(t *testing.T) {
 	set := processortest.NewNopSettings(component.MustNewType("cardinality_guardian"))
 	proc, err := newCardinalityProcessor(t.Context(), cfg, set, next)
 	require.NoError(t, err)
+	warmUp(proc)
 
 	// Fire 100 metrics with unique user_ids
 	for i := range 100 {
@@ -332,6 +341,7 @@ func TestEnforcementResolvesIdentityCollisions(t *testing.T) {
 	set := processortest.NewNopSettings(component.MustNewType("cardinality_guardian"))
 	proc, err := newCardinalityProcessor(t.Context(), cfg, set, next)
 	require.NoError(t, err)
+	warmUp(proc)
 
 	// Send 3 data points for the same metric with different user_ids.
 	// Using Delta Sum so that reaggregation can sum the values.
@@ -430,6 +440,7 @@ func TestInternalTelemetry(t *testing.T) {
 	next := new(consumertest.MetricsSink)
 	proc, err := newCardinalityProcessor(t.Context(), cfg, set, next)
 	require.NoError(t, err)
+	warmUp(proc)
 
 	// --- Phase 1: create exactly 5 trackers, 0 drops --------------------------
 	//
@@ -632,6 +643,56 @@ func TestCardinalityProcessor_EpochRotation(t *testing.T) {
 	shard.mu.RLock()
 	require.NotNil(t, tracker.previous)
 	shard.mu.RUnlock()
+}
+
+// TestFirstEpochBuildsBaseline verifies that a stable label above the limit
+// is never stripped: not in the first epoch, which only builds the baseline,
+// and not after rotation, when its delta is zero.
+func TestFirstEpochBuildsBaseline(t *testing.T) {
+	cfg := &Config{
+		MaxCardinalityDeltaPerEpoch: 50,
+		EpochDurationSeconds:        300,
+	}
+
+	set := processortest.NewNopSettings(component.MustNewType("cardinality_guardian"))
+	proc, err := newCardinalityProcessor(t.Context(), cfg, set, new(consumertest.MetricsSink))
+	require.NoError(t, err)
+
+	p := proc.(*cardinalityProcessor)
+
+	for epoch := 1; epoch <= 3; epoch++ {
+		for i := range 600 {
+			val := pcommon.NewValueStr(fmt.Sprintf("user-%d", i))
+			require.Falsef(t, p.shouldDrop("http.requests", "user_id", val),
+				"stable label stripped in epoch %d at value %d", epoch, i)
+		}
+		p.rotate()
+	}
+}
+
+// TestNewLabelAfterWarmUpIsEnforced verifies that a label first seen after
+// the first epoch is enforced from its first data point.
+func TestNewLabelAfterWarmUpIsEnforced(t *testing.T) {
+	cfg := &Config{
+		MaxCardinalityDeltaPerEpoch: 50,
+		EpochDurationSeconds:        300,
+	}
+
+	set := processortest.NewNopSettings(component.MustNewType("cardinality_guardian"))
+	proc, err := newCardinalityProcessor(t.Context(), cfg, set, new(consumertest.MetricsSink))
+	require.NoError(t, err)
+
+	p := proc.(*cardinalityProcessor)
+	p.rotate()
+
+	var dropCount int
+	for i := range 100 {
+		if p.shouldDrop("http.requests", "request_id", pcommon.NewValueStr(fmt.Sprintf("req-%d", i))) {
+			dropCount++
+		}
+	}
+	assert.InDelta(t, 50, dropCount, 10,
+		"new label after warm-up must be enforced at the 50-value limit (dropped %d)", dropCount)
 }
 
 // TestTopOffenders verifies that the otelcol_processor_cardinality_top.offenders gauge correctly
@@ -1072,6 +1133,7 @@ func TestMetricOverrides_FallbackToGlobal(t *testing.T) {
 	require.NoError(t, err)
 
 	p := proc.(*cardinalityProcessor)
+	warmUp(proc)
 
 	// Send 20 unique values to a metric NOT in overrides — should drop after 5
 	var dropCount int
@@ -1116,6 +1178,7 @@ func TestDropLogSampling_LimitEnforced(t *testing.T) {
 
 	p := proc.(*cardinalityProcessor)
 	p.logger = zap.New(core)
+	warmUp(proc)
 
 	// Send 50 unique attribute values through handleAttributes
 	// After 5 unique values, shouldDrop returns true and drops start logging
@@ -1148,6 +1211,7 @@ func TestDropLogSampling_Disabled(t *testing.T) {
 
 	p := proc.(*cardinalityProcessor)
 	p.logger = zap.New(core)
+	warmUp(proc)
 
 	for i := range 30 {
 		attrs := pmetric.NewMetrics().ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics().AppendEmpty().SetEmptyGauge().DataPoints().AppendEmpty().Attributes()
@@ -1177,6 +1241,7 @@ func TestDropLogSampling_ResetOnRotate(t *testing.T) {
 
 	p := proc.(*cardinalityProcessor)
 	p.logger = zap.New(core)
+	warmUp(proc)
 
 	// Fill epoch 1 — only 2 logs emitted
 	for i := range 20 {
@@ -1215,6 +1280,7 @@ func TestOverflowAttributeMode(t *testing.T) {
 	set := processortest.NewNopSettings(component.MustNewType("cardinality_guardian"))
 	proc, err := newCardinalityProcessor(t.Context(), cfg, set, next)
 	require.NoError(t, err)
+	warmUp(proc)
 
 	md := pmetric.NewMetrics()
 	rm := md.ResourceMetrics().AppendEmpty()
@@ -1280,6 +1346,7 @@ func TestCumulativeSumFallsBackToTagOnly(t *testing.T) {
 	set := processortest.NewNopSettings(component.MustNewType("cardinality_guardian"))
 	proc, err := newCardinalityProcessor(t.Context(), cfg, set, next)
 	require.NoError(t, err)
+	warmUp(proc)
 
 	md := pmetric.NewMetrics()
 	rm := md.ResourceMetrics().AppendEmpty()
@@ -1335,6 +1402,7 @@ func TestUnsupportedMetricTypesFallBackToTagOnly(t *testing.T) {
 	set := processortest.NewNopSettings(component.MustNewType("cardinality_guardian"))
 	proc, err := newCardinalityProcessor(t.Context(), cfg, set, next)
 	require.NoError(t, err)
+	warmUp(proc)
 
 	md := pmetric.NewMetrics()
 	rm := md.ResourceMetrics().AppendEmpty()
@@ -1419,6 +1487,7 @@ func TestProcessHistogramTypes(t *testing.T) {
 	set := processortest.NewNopSettings(component.MustNewType("cardinality_guardian"))
 	proc, err := newCardinalityProcessor(t.Context(), cfg, set, next)
 	require.NoError(t, err)
+	warmUp(proc)
 
 	md := pmetric.NewMetrics()
 	rm := md.ResourceMetrics().AppendEmpty()
@@ -1582,6 +1651,7 @@ func TestHandleAttributes_DropLogMaxZero(t *testing.T) {
 	proc, err := newCardinalityProcessor(t.Context(), cfg, set, new(consumertest.MetricsSink))
 	require.NoError(t, err)
 	p := proc.(*cardinalityProcessor)
+	warmUp(proc)
 
 	// Push enough unique values to trigger the drop path repeatedly.
 	attrs := pcommon.NewMap()
